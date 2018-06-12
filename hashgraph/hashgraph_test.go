@@ -841,8 +841,7 @@ func TestRoundDiff(t *testing.T) {
 func TestDivideRounds(t *testing.T) {
 	h, index := initRoundHashgraph(t)
 
-	err := h.DivideRounds()
-	if err != nil {
+	if err := h.DivideRounds(); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1077,11 +1076,12 @@ func TestInsertEventsWithBlockSignatures(t *testing.T) {
 }
 
 /*
+                  Round 4
 		i0  |   i2
 		| \ | / |
 		|   i1  |
-		|  /|   |
-		h02 |   |
+------- |  /|   | --------------------------------
+		h02 |   | Round 3
 		| \ |   |
 		|   \   |
 		|   | \ |
@@ -1092,8 +1092,8 @@ func TestInsertEventsWithBlockSignatures(t *testing.T) {
 		h0  |   h2
 		| \ | / |
 		|   h1  |
-		|  /|   |
-		g02 |   |
+------- |  /|   | --------------------------------
+		g02 |   | Round 2
 		| \ |   |
 		|   \   |
 		|   | \ |
@@ -1104,12 +1104,12 @@ func TestInsertEventsWithBlockSignatures(t *testing.T) {
 		g0  |   g2
 		| \ | / |
 		|   g1  |
-		|  /|   |
-		f02b|   |
-		|   |   |
-		f02 |   |
-		| \ |   |
-		|   \   |
+------- |  /|   | -------------------------------
+		f02b|   |  Round 1           +---------+
+		|   |   |                    | Block 1 |
+		f02 |   |                    | RR    2 |
+		| \ |   |                    | Evs   9 |
+		|   \   |                    +---------+
 		|   | \ |
 	---f0x  |   f21 //f0x's other-parent is e21b. This situation can happen with concurrency
 	|	|   | / |
@@ -1120,17 +1120,17 @@ func TestInsertEventsWithBlockSignatures(t *testing.T) {
 	|	|  f1b  |
 	|	|   |   |
 	|	|   f1  |
-	|	|  /|   |
-	|	e02 |   |
-	|	| \ |   |
-	|	|   \   |
-	|	|   | \ |
-	----------- e21b
+---	| -	|  /|   | ------------------------------
+	|	e02 |   |  Round 0          +---------+
+	|	| \ |   |                   | Block 0 |
+	|	|   \   |                   | RR    1 |
+	|	|   | \ |                   | Evs   7 |
+	----------- e21b                +---------+
 		|   |   |
 		|   |  e21
 		|   | / |
 		|  e10  |
-		| / |   |
+	    | / |   |
 		e0  e1  e2
 		0   1    2
 */
@@ -1218,7 +1218,9 @@ func TestDecideFame(t *testing.T) {
 	h, index := initConsensusHashgraph(false, t)
 
 	h.DivideRounds()
-	h.DecideFame()
+	if err := h.DecideFame(); err != nil {
+		t.Fatal(err)
+	}
 
 	round0, err := h.Store.GetRound(0)
 	if err != nil {
@@ -1319,7 +1321,9 @@ func TestDecideRoundReceived(t *testing.T) {
 
 	h.DivideRounds()
 	h.DecideFame()
-	h.DecideRoundReceived()
+	if err := h.DecideRoundReceived(); err != nil {
+		t.Fatal(err)
+	}
 
 	for name, hash := range index {
 		e, _ := h.Store.GetEvent(hash)
@@ -1383,6 +1387,10 @@ func TestDecideRoundReceived(t *testing.T) {
 			t.Fatalf("UndeterminedEvents[%d] should be %s, not %s", i, eue, ue)
 		}
 	}
+
+	if v := h.LowestRoundWithUndecidedEvents; v != 2 {
+		t.Fatalf("LowestRoundWithUndecidedEvents should be 2, not %d", v)
+	}
 }
 
 func TestProcessDecidedRounds(t *testing.T) {
@@ -1396,28 +1404,27 @@ func TestProcessDecidedRounds(t *testing.T) {
 	}
 
 	//--------------------------------------------------------------------------
-	for i, e := range h.ConsensusEvents() {
+	consensusEvents := h.ConsensusEvents()
+
+	for i, e := range consensusEvents {
 		t.Logf("consensus[%d]: %s\n", i, getName(index, e))
 	}
 
-	if l := len(h.ConsensusEvents()); l != 16 {
+	if l := len(consensusEvents); l != 16 {
 		t.Fatalf("length of consensus should be 16 not %d", l)
+	}
+
+	//Events which have the same consensus timestamp are ordered by whitened
+	//signature which is not deterministic; It is hard to test the ordering.
+	if n := getName(index, consensusEvents[0]); n != "e0" {
+		t.Fatalf("consensus[0] should be e0, not %s", n)
+	}
+	if n := getName(index, consensusEvents[6]); n != "e02" {
+		t.Fatalf("consensus[6] should be e02, not %s", n)
 	}
 
 	if ple := h.PendingLoadedEvents; ple != 2 {
 		t.Fatalf("PendingLoadedEvents should be 2, not %d", ple)
-	}
-
-	consensusEvents := h.ConsensusEvents()
-
-	if n := getName(index, consensusEvents[0]); n != "e0" {
-		t.Fatalf("consensus[0] should be e0, not %s", n)
-	}
-
-	//events which have the same consensus timestamp are ordered by whitened
-	//signature which is not deterministic.
-	if n := getName(index, consensusEvents[6]); n != "e02" {
-		t.Fatalf("consensus[6] should be e02, not %s", n)
 	}
 
 	//Block 0 ------------------------------------------------------------------
@@ -1490,6 +1497,15 @@ func TestProcessDecidedRounds(t *testing.T) {
 			t.Fatalf("PendingRounds[%d] should be %v, not %v", i, expectedPendingRounds[i], *pd)
 		}
 	}
+
+	//Anchor -------------------------------------------------------------------
+	if v := h.LowestRoundWithUndecidedEvents; v != 2 {
+		t.Fatalf("LowestRoundWithUndecidedEvents should be 2, not %d", v)
+	}
+	if v := h.AnchorBlock; v != 1 {
+		t.Fatalf("AnchorBlock should be 1, not %d", v)
+	}
+
 }
 
 func BenchmarkConsensus(b *testing.B) {
@@ -1751,8 +1767,23 @@ func TestResetFromFrame(t *testing.T) {
 	h.DecideRoundReceived()
 	h.ProcessDecidedRounds()
 
-	if r := h.LastConsensusRound; r != nil {
-		t.Fatalf("LastConsensusRound should be nil, not %#v", r)
+	if lbi := h.LastBlockIndex; lbi != block.Index() {
+		t.Fatalf("LastBlockIndex should be %d, not %d", block.Index(), lbi)
+	}
+
+	if r := h.LastConsensusRound; r == nil || *r != block.RoundReceived() {
+		t.Fatalf("LastConsensusRound should be %d, not %d", block.RoundReceived(), *r)
+	}
+
+	// After Reset, no rounds are added to PendingRounds (because, by definition,
+	// the Frame events come from a committed block); Hence LowestRoundWithUndecidedEvents
+	//and AnchorBlock are not updated yet.
+	if v := h.LowestRoundWithUndecidedEvents; v != -1 {
+		t.Fatalf("LowestRoundWithUndecidedEvents should be -1, not %d", v)
+	}
+
+	if v := h.AnchorBlock; v != -1 {
+		t.Fatalf("AnchorBlock should be -1, not %d", v)
 	}
 }
 
@@ -2017,6 +2048,10 @@ func TestFunkyHashgraphFame(t *testing.T) {
 		if !reflect.DeepEqual(*pd, expectedPendingRounds[i]) {
 			t.Fatalf("PendingRounds[%d] should be %v, not %v", i, expectedPendingRounds[i], *pd)
 		}
+	}
+
+	if v := h.LowestRoundWithUndecidedEvents; v != 1 {
+		t.Fatalf("LowestRoundWithUndecidedEvents should be 1, not %d", v)
 	}
 }
 

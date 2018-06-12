@@ -548,7 +548,7 @@ func TestCoreFastForward(t *testing.T) {
 		t.Fatalf("Cores[0].Known should be %v, not %v", expectedKnown, knownBy0)
 	}
 
-	if r := cores[0].GetLastConsensusRoundIndex(); r != nil {
+	if r := cores[0].GetLastConsensusRoundIndex(); r == nil || *r != block.RoundReceived() {
 		t.Fatalf("Cores[0] last consensus Round should be nil, not %v", r)
 	}
 

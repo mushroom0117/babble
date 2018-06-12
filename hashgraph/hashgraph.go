@@ -33,6 +33,10 @@ type Hashgraph struct {
 	topologicalIndex        int              //counter used to order events in topological order (only local)
 	superMajority           int
 
+	//XXX
+	LowestRoundWithUndecidedEvents int
+	AnchorBlock                    int
+
 	ancestorCache           *common.LRU
 	selfAncestorCache       *common.LRU
 	oldestSelfAncestorCache *common.LRU
@@ -57,19 +61,21 @@ func NewHashgraph(participants map[string]int, store Store, commitCh chan Block,
 
 	cacheSize := store.CacheSize()
 	hashgraph := Hashgraph{
-		Participants:            participants,
-		ReverseParticipants:     reverseParticipants,
-		Store:                   store,
-		commitCh:                commitCh,
-		ancestorCache:           common.NewLRU(cacheSize, nil),
-		selfAncestorCache:       common.NewLRU(cacheSize, nil),
-		oldestSelfAncestorCache: common.NewLRU(cacheSize, nil),
-		stronglySeeCache:        common.NewLRU(cacheSize, nil),
-		parentRoundCache:        common.NewLRU(cacheSize, nil),
-		roundCache:              common.NewLRU(cacheSize, nil),
-		logger:                  logger,
-		superMajority:           2*len(participants)/3 + 1,
-		LastBlockIndex:          -1,
+		Participants:                   participants,
+		ReverseParticipants:            reverseParticipants,
+		Store:                          store,
+		commitCh:                       commitCh,
+		ancestorCache:                  common.NewLRU(cacheSize, nil),
+		selfAncestorCache:              common.NewLRU(cacheSize, nil),
+		oldestSelfAncestorCache:        common.NewLRU(cacheSize, nil),
+		stronglySeeCache:               common.NewLRU(cacheSize, nil),
+		parentRoundCache:               common.NewLRU(cacheSize, nil),
+		roundCache:                     common.NewLRU(cacheSize, nil),
+		logger:                         logger,
+		superMajority:                  2*len(participants)/3 + 1,
+		LastBlockIndex:                 -1,
+		LowestRoundWithUndecidedEvents: -1,
+		AnchorBlock:                    -1,
 	}
 
 	return &hashgraph
@@ -626,7 +632,9 @@ func (h *Hashgraph) ReadWireInfo(wevent WireEvent) (*Event, error) {
 }
 
 func (h *Hashgraph) DivideRounds() error {
+
 	for _, hash := range h.UndeterminedEvents {
+
 		roundNumber := h.Round(hash)
 		witness := h.Witness(hash)
 		roundInfo, err := h.Store.GetRound(roundNumber)
@@ -638,12 +646,16 @@ func (h *Hashgraph) DivideRounds() error {
 		if err != nil && !common.Is(err, common.KeyNotFound) {
 			return err
 		}
+
 		//If the RoundInfo is actually taken from the Store's DB, then it still
 		//has not been processed by the Hashgraph consensus methods (The 'queued'
 		//field is not exported and therefore not persisted in the DB).
 		//RoundInfos taken from the DB directly will always have this field set
-		//to false
-		if !roundInfo.queued {
+		//to false. Also do not queue rounds that have already been decided
+		if !roundInfo.queued &&
+			(h.LastConsensusRound == nil ||
+				roundNumber > *h.LastConsensusRound) {
+
 			h.PendingRounds = append(h.PendingRounds, &PendingRound{roundNumber, false})
 			roundInfo.queued = true
 		}
@@ -654,6 +666,7 @@ func (h *Hashgraph) DivideRounds() error {
 			return err
 		}
 	}
+
 	return nil
 }
 
@@ -753,6 +766,11 @@ func (h *Hashgraph) DecideRoundReceived() error {
 
 	newUndeterminedEvents := []string{}
 
+	lowestRoundWithUndecidedEvents := -1
+	if l := len(h.PendingRounds); l > 0 {
+		lowestRoundWithUndecidedEvents = h.PendingRounds[l-1].Index
+	}
+
 	/* From whitepaper - 18/03/18
 	   "[...] An event is said to be “received” in the first round where all the
 	   unique famous witnesses have received it, if all earlier rounds have the
@@ -818,10 +836,15 @@ func (h *Hashgraph) DecideRoundReceived() error {
 		}
 		if !received {
 			newUndeterminedEvents = append(newUndeterminedEvents, x)
+			if r := h.Round(x); r < lowestRoundWithUndecidedEvents {
+				lowestRoundWithUndecidedEvents = r
+			}
 		}
 	}
 
 	h.UndeterminedEvents = newUndeterminedEvents
+	h.LowestRoundWithUndecidedEvents = lowestRoundWithUndecidedEvents
+
 	return nil
 }
 
@@ -848,6 +871,13 @@ func (h *Hashgraph) ProcessDecidedRounds() error {
 		}
 
 		events := frame.Events
+
+		//XXX
+		h.logger.WithFields(logrus.Fields{
+			"index":  r.Index,
+			"events": len(events),
+		}).Debug("Processing Decided Round")
+
 		if len(events) > 0 {
 			sorter := NewConsensusSorter(events)
 			sort.Sort(sorter)
@@ -864,14 +894,25 @@ func (h *Hashgraph) ProcessDecidedRounds() error {
 				}
 			}
 
-			block, err := h.createAndInsertBlock(frame)
+			block, err := h.createBlock(frame)
 			if err != nil {
 				return err
+			}
+			h.LastBlockIndex++
+
+			if err := h.Store.SetBlock(block); err != nil {
+				return err
+			}
+
+			if r.Index >= h.LowestRoundWithUndecidedEvents &&
+				h.LastBlockIndex >= h.AnchorBlock {
+				h.AnchorBlock = h.LastBlockIndex
 			}
 
 			if h.commitCh != nil {
 				h.commitCh <- block
 			}
+
 		} else {
 			h.logger.Debugf("No Events to commit for ConsensusRound %d", r.Index)
 		}
@@ -893,6 +934,7 @@ func (h *Hashgraph) setLastConsensusRound(i int) {
 	}
 	*h.LastConsensusRound = i
 
+	//XXX - what's this?
 	h.LastCommitedRoundEvents = h.Store.RoundEvents(i - 1)
 }
 
@@ -996,18 +1038,12 @@ func (h *Hashgraph) GetFrame(roundReceived int) (Frame, error) {
 	return frame, nil
 }
 
-func (h *Hashgraph) createAndInsertBlock(frame Frame) (Block, error) {
+func (h *Hashgraph) createBlock(frame Frame) (Block, error) {
 
 	block, err := NewBlockFromFrame(h.LastBlockIndex+1, frame)
 	if err != nil {
 		return block, err
 	}
-
-	if err := h.Store.SetBlock(block); err != nil {
-		return Block{}, err
-	}
-
-	h.LastBlockIndex++
 
 	return block, nil
 }
@@ -1116,10 +1152,15 @@ func (h *Hashgraph) Reset(block Block, frame Frame) error {
 	}
 	h.LastBlockIndex = block.Index()
 
+	//XXX
+	lastConsensusRound := block.RoundReceived()
+	h.LastConsensusRound = &lastConsensusRound
+	h.LowestRoundWithUndecidedEvents = -1
+	h.AnchorBlock = -1
+
 	h.UndeterminedEvents = []string{}
 	h.PendingRounds = []*PendingRound{}
 	h.PendingLoadedEvents = 0
-	h.LastConsensusRound = nil
 	h.topologicalIndex = 0
 
 	cacheSize := h.Store.CacheSize()
@@ -1150,7 +1191,7 @@ func (h *Hashgraph) GetLatestFrame() (Frame, error) {
 
 func (h *Hashgraph) GetLatestBlockWithFrame() (Block, Frame, error) {
 
-	block, err := h.Store.GetBlock(h.LastBlockIndex)
+	block, err := h.Store.GetBlock(h.AnchorBlock)
 	if err != nil {
 		return Block{}, Frame{}, err
 	}

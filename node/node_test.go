@@ -523,7 +523,7 @@ func TestCatchUp(t *testing.T) {
 	//Create  config for 4 nodes
 	keys, peers, pmap := initPeers(4)
 
-	//initialize the first 3 nodes only
+	//Initialize the first 3 nodes only
 	normalNodes := initNodes(keys[0:3], peers, pmap, 1000, 400, "inmem", logger, t)
 	defer shutdownNodes(normalNodes)
 
@@ -536,27 +536,38 @@ func TestCatchUp(t *testing.T) {
 	checkGossip(normalNodes, t)
 
 	node4 := initNodes(keys[3:], peers, pmap, 1000, 400, "inmem", logger, t)[0]
+
+	//Run parallel routine to check node4 eventually reaches CatchingUp state.
+	timeout := time.After(6 * time.Second)
+	continueCh := make(chan struct{})
+	go func() {
+		for {
+			select {
+			case <-timeout:
+				t.Fatalf("Timeout waiting for node4 to enter CatchingUp state")
+			default:
+			}
+			time.Sleep(10 * time.Millisecond)
+			if node4.getState() == CatchingUp {
+				continueCh <- struct{}{}
+				break
+			}
+		}
+	}()
+
 	node4.RunAsync(true)
 	defer node4.Shutdown()
 
-	timeout := time.After(3 * time.Second)
-	for {
-		select {
-		case <-timeout:
-			t.Fatalf("Timeout waiting for node4 to enter CatchingUp state")
-		default:
+	//Wait until node4 has caught up and advanced with the rest of the nodes
+	select {
+	case <-timeout:
+		t.Fatalf("Timeout waiting for node4 to enter CatchingUp state")
+	case <-continueCh:
+		nodes := append(normalNodes, node4)
+		err = bombardAndWait(nodes, target+20, 6*time.Second)
+		if err != nil {
+			t.Fatal(err)
 		}
-		time.Sleep(10 * time.Millisecond)
-		if node4.getState() == CatchingUp {
-			break
-		}
-	}
-
-	//wait until node 0 has caught up
-	nodes := append(normalNodes, node4)
-	err = bombardAndWait(nodes, target+20, 6*time.Second)
-	if err != nil {
-		t.Fatal(err)
 	}
 }
 
@@ -625,7 +636,7 @@ func bombardAndWait(nodes []*Node, target int, timeout time.Duration) error {
 	quit := make(chan struct{})
 	makeRandomTransactions(nodes, quit)
 
-	//wait until all nodes have at least 'target' rounds
+	//wait until all nodes have at least 'target' blcoks
 	stopper := time.After(timeout)
 	for {
 		select {
@@ -636,8 +647,8 @@ func bombardAndWait(nodes []*Node, target int, timeout time.Duration) error {
 		time.Sleep(10 * time.Millisecond)
 		done := true
 		for _, n := range nodes {
-			ce := n.core.GetLastConsensusRoundIndex()
-			if ce == nil || *ce < target {
+			ce := n.core.GetLastBlockIndex()
+			if ce < target {
 				done = false
 				break
 			}
